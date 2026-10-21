@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+/*
+ * openjdk8-javaws -- Java Web Start under Node.js: IcedTea-Web's javaws
+ * (openjdk8-javaws.jar) on the WebAssembly OpenJDK 8 runtime.
+ *
+ *   openjdk8-javaws [javaws options] <file.jnlp or URL>
+ *
+ * This is openjdk8-java, which runs javaws when started under this name
+ * (see there for the environment variables).  AWT is headless, so javaws
+ * runs in its headless mode: security questions are asked on the console.
+ */
+'use strict';
+require('./openjdk8-java');

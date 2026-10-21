@@ -12,8 +12,13 @@
  *   OpenJDK8.run({ args: ['-cp', '/app', 'Main'], root: element,
  *                  files: { '/app/Main.class': 'Main.class' } })
  *
- * The runtime files (openjdk8.js, openjdk8.wasm, openjdk8-jre.json, openjdk8-jre.data.gz) are loaded from
- * the directory of this script, or from data-base / options.base.
+ * Java Web Start: following a link to a .jnlp file starts the application
+ * with IcedTea-Web's javaws (openjdk8-javaws.jar) instead (disable with
+ * data-jnlp="off" on the script tag), as does OpenJDK8.runJNLP(url).
+ *
+ * The runtime files (openjdk8.js, openjdk8.wasm, openjdk8-jre.json, openjdk8-jre.data.gz,
+ * openjdk8-javaws.jar) are loaded from the directory of this script, or from
+ * data-base / options.base.
  *
  * Copyright (c) 2026 emscripten-forge contributors.  GPL-2.0 with the
  * Classpath exception, like OpenJDK.
@@ -31,6 +36,13 @@
     '-Dsun.java2d.pmoffscreen=false',
     '-Dsun.java2d.xrender=false',
     '-Duser.dir=/home/web_user',
+    // there is no password database to take these from
+    '-Duser.home=/home/web_user',
+    '-Duser.name=web_user',
+    // x11.wasm keeps window contents (canvases), so Swing need not keep a
+    // back buffer per window; with one, a window resized right after its
+    // first paint could stay blank until repainted
+    '-Dswing.bufferPerWindow=false',
   ];
 
   var STYLE = [
@@ -42,6 +54,13 @@
     '.openjdk8-applet-box{display:inline-block;position:relative;box-sizing:border-box;background:#f2f2f2;',
     'border:1px solid #c9c9c9;color:#555;font:12px/1.4 system-ui,sans-serif;overflow:hidden;vertical-align:bottom}',
     '.openjdk8-applet-box span{position:absolute;left:8px;right:8px;top:50%;transform:translateY(-50%);text-align:center}',
+    // Web Start: the X screen is the viewport
+    'div.openjdk8-javaws-root,div.openjdk8-javaws-root.x11-wasm-root{position:fixed!important;left:0;top:0;',
+    'width:100vw;height:100vh;margin:0;padding:0;border:0;pointer-events:none;z-index:2147483000;',
+    'overflow:hidden!important;background:transparent!important}',
+    '.openjdk8-javaws-root .x11-wasm-window,.openjdk8-javaws-root [data-x11-wasm-frame]{pointer-events:auto}',
+    '.openjdk8-javaws-status{position:fixed;right:12px;bottom:12px;z-index:2147483001;padding:6px 10px;',
+    'background:#222;color:#eee;font:12px/1.4 system-ui,sans-serif;border-radius:4px;opacity:.9}',
   ].join('');
 
   function loadScript(src) {
@@ -69,7 +88,9 @@
    * Start a JVM.  options: args (array), root (element for windows),
    * base, files ({vmPath: url}), env, jvmArgs (extra), onStdout, onStderr,
    * onStatus, onProgress, onExit, heap (e.g. '256m'), documentTitle (false:
-   * keep the page title), audioContext (an AudioContext to play sound on).
+   * keep the page title), audioContext (an AudioContext to play sound on),
+   * windowManager (true: x11.wasm draws title bars, so that top-level
+   * windows can be moved, minimized and closed).
    * Returns a promise for the Emscripten module once main() has started.
    */
   function run(options) {
@@ -87,6 +108,7 @@
         // the title of a top-level Java window becomes the page title
         // unless documentTitle is false (always false for applets)
         x11WasmDocumentTitle: options.documentTitle !== false,
+        x11WasmWindowManager: !!options.windowManager,
         audioContext: options.audioContext,
         javaEnv: options.env || {},
         print: options.onStdout || function (s) { console.log(s); },
@@ -290,13 +312,95 @@
     }));
   }
 
+  // -------------------------------------------------------- Web Start
+
+  /**
+   * Java Web Start: run the application (or applet) a JNLP file describes,
+   * with IcedTea-Web's javaws.  url is resolved against the page; the JNLP
+   * file and its jars are fetched like any URL the Java code opens (same
+   * origin, or CORS).  Its windows appear in a viewport-sized layer over the
+   * page.  options as for run(), plus javawsArgs (more javaws options, e.g.
+   * ['-verbose']).  The security dialogs of javaws (unsigned code, missing
+   * manifest attributes, certificates) are shown like any Java window.
+   */
+  function runJNLP(url, options) {
+    options = options || {};
+    var base = options.base || defaultBase;
+    if (base && base.slice(-1) !== '/') base += '/';
+    var href = new URL(url, location.href).href;
+    addStyle();
+    var root = options.root;
+    if (!root) {
+      root = document.createElement('div');
+      root.className = 'openjdk8-javaws-root';
+      document.body.appendChild(root);
+    }
+    var status = null;
+    if (!options.onProgress && !options.onStatus) {
+      status = document.createElement('div');
+      status.className = 'openjdk8-javaws-status';
+      status.textContent = 'Starting Java Web Start\u2026';
+      document.body.appendChild(status);
+    }
+    var done = function () { if (status && status.parentNode) status.parentNode.removeChild(status); };
+    var files = Object.assign({}, options.files || {});
+    files['/java/lib/javaws.jar'] = base + 'openjdk8-javaws.jar';
+    var userExit = options.onExit;
+    var userStdout = options.onStdout;
+    return run(Object.assign({}, options, {
+      root: root,
+      files: files,
+      documentTitle: options.documentTitle === true,
+      // like IcedTea-Web's javaws launcher; -Xnofork: there are no processes
+      // to relaunch the VM with the JNLP file's JVM options
+      args: (options.jvmArgs || []).concat([
+        '-Xbootclasspath/a:/java/lib/javaws.jar',
+        '-Dicedtea-web.bin.name=javaws',
+        'net.sourceforge.jnlp.runtime.Boot', '-Xnofork',
+      ], options.javawsArgs || [], [href]),
+      jvmArgs: [],
+      onProgress: options.onProgress || function (loaded, total) {
+        if (status) status.textContent = 'Loading Java runtime ' +
+          Math.round(100 * loaded / Math.max(total, 1)) + '%';
+      },
+      onStdout: function (s) {
+        // javaws reports the start of the application on the console
+        if (/^Starting application/.test(s)) done();
+        (userStdout || function (t) { console.log(t); })(s);
+      },
+      onExit: function (rc) { done(); if (userExit) userExit(rc); },
+    })).then(function (M) {
+      // the splash screen or a security dialog is up after a while
+      setTimeout(done, 15000);
+      return M;
+    }, function (e) { done(); throw e; });
+  }
+
+  function isJnlpLink(a) {
+    return a && a.href && /\.jnlp$/i.test(a.pathname) &&
+           !a.hasAttribute('download') && (!a.target || a.target === '_self');
+  }
+
   global.OpenJDK8 = { run: run, runApplets: runApplets, findApplets: findApplets,
-                      defaultJvmArgs: DEFAULT_JVM_ARGS };
+                      runJNLP: runJNLP, defaultJvmArgs: DEFAULT_JVM_ARGS };
 
   var auto = thisScript ? thisScript.getAttribute('data-applets') : null;
   if (auto !== 'off') {
     var go = function () { if (findApplets().length) runApplets(); };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go);
     else go();
+  }
+  if (!thisScript || thisScript.getAttribute('data-jnlp') !== 'off') {
+    document.addEventListener('click', function (ev) {
+      if (ev.defaultPrevented || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+      var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+      if (!isJnlpLink(a)) return;
+      ev.preventDefault();
+      if (running) {
+        console.warn('Java Web Start: a Java VM is already running in this page');
+        return;
+      }
+      runJNLP(a.href).catch(function (e) { console.error('Java Web Start: ' + e); });
+    });
   }
 })(typeof globalThis !== 'undefined' ? globalThis : window);

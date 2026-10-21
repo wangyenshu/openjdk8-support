@@ -3,6 +3,9 @@
  * openjdk8-java -- run the WebAssembly OpenJDK 8 runtime under Node.js.
  *
  *   openjdk8-java [options] <mainclass> [args...]  (the options of OpenJDK's java)
+ *   openjdk8-javaws [options] <file.jnlp or URL>   (Java Web Start: IcedTea-Web's
+ *                                                   javaws, openjdk8-javaws.jar;
+ *                                                   node/openjdk8-javaws)
  *
  * The host file system is visible at the usual paths and the current
  * directory is the working directory.  AWT runs headless (Java2D, fonts and
@@ -18,12 +21,14 @@
 'use strict';
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const javaws = path.basename(process.argv[1] || '') === 'openjdk8-javaws';
 
 if (typeof WebAssembly.Suspending !== 'function') {
   const major = parseInt(process.versions.node, 10);
   if (major === 24 && !process.env.__OPENJDK8_JSPI) {
     const r = require('child_process').spawnSync(process.execPath,
-      ['--experimental-wasm-jspi', __filename, ...process.argv.slice(2)],
+      ['--experimental-wasm-jspi', process.argv[1], ...process.argv.slice(2)],
       { stdio: 'inherit', env: Object.assign({}, process.env, { __OPENJDK8_JSPI: '1' }) });
     process.exit(r.status === null ? 1 : r.status);
   }
@@ -68,6 +73,10 @@ function readStdin() {
 // Mount the host's top-level directories at the same paths.
 function mountHost(M) {
   const FS = M.FS;
+  // RandomAccessFile "rws" opens with O_SYNC; Emscripten's NODEFS knows
+  // only its O_DSYNC part and rejects the extra bit with EINVAL.
+  const flagsForNode = M.NODEFS.flagsForNode;
+  M.NODEFS.flagsForNode = (flags) => flagsForNode.call(M.NODEFS, flags & ~0o4000000);
   const skip = new Set(['dev', 'proc', 'sys', 'java']);
   for (const name of fs.readdirSync('/')) {
     if (skip.has(name)) continue;
@@ -85,11 +94,23 @@ function mountHost(M) {
   try { FS.chdir(process.cwd()); } catch (e) {}
 }
 
+let userName = process.env.USER || 'user';
+try { userName = os.userInfo().username; } catch (e) {}
 const jvmArgs = [
   '-Djava.awt.headless=true',
   '-Djava.protocol.handler.pkgs=org.emscriptenforge.jvm.net',
+  // there is no password database to take these from
+  '-Duser.home=' + (process.env.HOME || os.homedir()),
+  '-Duser.name=' + userName,
   ...(process.env.OPENJDK8_WASM_OPTIONS || '').split(' ').filter(Boolean),
 ];
+// Java Web Start, as IcedTea-Web's javaws launcher runs it; -Xnofork: no
+// processes to relaunch the VM with the JNLP file's JVM options
+const javawsArgs = javaws ? [
+  '-Xbootclasspath/a:' + path.join(fs.realpathSync(home), 'openjdk8-javaws.jar'),
+  '-Dicedtea-web.bin.name=javaws',
+  'net.sourceforge.jnlp.runtime.Boot', '-Xnofork',
+] : [];
 
 let exitCode = 0;
 createOpenJDK8Module({
@@ -106,7 +127,7 @@ createOpenJDK8Module({
 }).then((M) => {
   let r;
   try {
-    r = M.callMain(jvmArgs.concat(process.argv.slice(2)));
+    r = M.callMain(jvmArgs.concat(javawsArgs, process.argv.slice(2)));
   } catch (e) {
     r = e;
   }
