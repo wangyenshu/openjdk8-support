@@ -391,6 +391,26 @@
     else go();
   }
   if (!thisScript || thisScript.getAttribute('data-jnlp') !== 'off') {
+    // Pages written for Oracle's deployJava.js launch Web Start with
+    // deployJava.launch(url) (the createWebStartLaunchButton button),
+    // launchEx(url) or launchWebStartApplication(url), which download the
+    // JNLP file or open a jnlp: URL: run it here instead.
+    var patchDeployJava = function () {
+      var dj = global.deployJava;
+      if (!dj || dj.__openjdk8) return;
+      dj.__openjdk8 = true;
+      dj.isWebStartInstalled = function () { return true; };
+      dj.launch = dj.launchEx = dj.launchWebStartApplication = function (url) {
+        if (running) {
+          console.warn('Java Web Start: a Java VM is already running in this page');
+        } else {
+          runJNLP(url).catch(function (e) { console.error('Java Web Start: ' + e); });
+        }
+        return true;
+      };
+    };
+    patchDeployJava();
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', patchDeployJava);
     document.addEventListener('click', function (ev) {
       if (ev.defaultPrevented || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
       var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
