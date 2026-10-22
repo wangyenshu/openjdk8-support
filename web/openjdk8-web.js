@@ -6,7 +6,9 @@
  * Applets: every <applet>, <object type="application/x-java-applet"> and
  * <embed type="application/x-java-applet"> element on the page is started
  * automatically (disable with data-applets="off" on the script tag, or call
- * OpenJDK8.runApplets() yourself).
+ * OpenJDK8.runApplets() yourself).  So are the applets that Oracle's
+ * deployJava.js writes with deployJava.runApplet(...), and an applet with a
+ * jnlp_href parameter takes its class and jars from that JNLP file.
  *
  * Applications:
  *   OpenJDK8.run({ args: ['-cp', '/app', 'Main'], root: element,
@@ -14,7 +16,11 @@
  *
  * Java Web Start: following a link to a .jnlp file starts the application
  * with IcedTea-Web's javaws (openjdk8-javaws.jar) instead (disable with
- * data-jnlp="off" on the script tag), as does OpenJDK8.runJNLP(url).
+ * data-jnlp="off" on the script tag), as does OpenJDK8.runJNLP(url) or
+ * deployJava.launch(url) of deployJava.js.
+ *
+ * Frames: iframes and frames of the same origin that have applets or Web
+ * Start links get a copy of this script (disable with data-frames="off").
  *
  * The runtime files (openjdk8.js, openjdk8.wasm, openjdk8-jre.json, openjdk8-jre.data.gz,
  * openjdk8-javaws.jar) are loaded from the directory of this script, or from
@@ -191,7 +197,9 @@
        'java_code', 'java_type', 'scriptable', 'mayscript'].forEach(function (k) { delete params[k]; });
       if (!spec.code && params.java_code) spec.code = params.java_code;
     }
-    if (!spec.code) return null;
+    // Java 6u10+ applets can be described by a JNLP file (resolveJnlp)
+    spec.jnlp = params.jnlp_href || null;
+    if (!spec.code && !spec.jnlp) return null;
     if (tag === 'embed') {
       // <embed> carries applet parameters as attributes
       for (var i = 0; i < el.attributes.length; i++) {
@@ -220,6 +228,42 @@
     return out;
   }
 
+  /**
+   * An applet with a jnlp_href parameter: take its class, jars and codebase
+   * from the JNLP file, as the Java Plug-in did (its <applet-desc> parameters
+   * too, unless the tag gives the same one).  If the file cannot be read,
+   * the tag's attributes are used as they are.
+   */
+  function resolveJnlp(a) {
+    if (!a.jnlp) return Promise.resolve();
+    var url = new URL(a.jnlp, new URL(a.codebase || '.', location.href)).href;
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    }).then(function (text) {
+      var jnlp = new DOMParser().parseFromString(text, 'application/xml').documentElement;
+      if (!jnlp || jnlp.nodeName !== 'jnlp') throw new Error('not a JNLP file');
+      var cb = jnlp.getAttribute('codebase');
+      var desc = jnlp.querySelector('applet-desc');
+      var jars = [];
+      jnlp.querySelectorAll('resources').forEach(function (r) {
+        var os = r.getAttribute('os');
+        if (os && !/linux/i.test(os)) return;
+        r.querySelectorAll(':scope > jar').forEach(function (j) {
+          var h = j.getAttribute('href');
+          if (h) j.getAttribute('main') === 'true' ? jars.unshift(h) : jars.push(h);
+        });
+      });
+      a.codebase = new URL(cb ? cb.replace(/\/*$/, '/') : '.', url).href;
+      if (jars.length) a.archive = jars.join(',');
+      if (desc && desc.getAttribute('main-class')) a.code = desc.getAttribute('main-class');
+      if (desc) desc.querySelectorAll('param').forEach(function (p) {
+        var n = (p.getAttribute('name') || '').toLowerCase();
+        if (n && !(n in a.params)) a.params[n] = p.getAttribute('value') || '';
+      });
+    }).catch(function (e) { console.warn('Java applet: ' + url + ': ' + e.message); });
+  }
+
   function documentSize() {
     var d = document.documentElement, b = document.body;
     return {
@@ -246,6 +290,7 @@
     // A box in the page flow reserves the applet's space; the applet's
     // window is placed over it in a page-sized overlay (the X screen).
     applets.forEach(function (a) {
+      a.el.__openjdk8 = true;
       var box = document.createElement('div');
       box.className = 'openjdk8-applet-box';
       box.style.width = a.width + 'px';
@@ -269,47 +314,55 @@
       });
     };
 
-    // Positions are polled by the applet host (see AppletRunner).
-    global.__openjdk8AppletLayout = function () {
-      var sz = documentSize();
-      root.style.width = sz.w + 'px';
-      root.style.height = sz.h + 'px';
-      return applets.map(function (a) { var p = boxPosition(a.box); return p.x + ',' + p.y; }).join(';');
-    };
+    return Promise.all(applets.map(resolveJnlp)).then(function () {
+      applets = applets.filter(function (a) {
+        if (!a.code) a.box.querySelector('span').textContent = 'Java applet: no class to run';
+        return a.code;
+      });
+      if (!applets.length) return null;
 
-    var args = ['org.emscriptenforge.jvm.applet.AppletRunner', '--documentbase', location.href];
-    applets.forEach(function (a) {
-      var p = boxPosition(a.box);
-      args.push('--applet', 'code=' + a.code, 'width=' + a.width, 'height=' + a.height,
-                'x=' + p.x, 'y=' + p.y);
-      if (a.codebase) args.push('codebase=' + a.codebase);
-      if (a.archive) args.push('archive=' + a.archive);
-      if (a.name) args.push('name=' + a.name);
-      Object.keys(a.params).forEach(function (k) { args.push('param:' + k + '=' + a.params[k]); });
+      // Positions are polled by the applet host (see AppletRunner).
+      global.__openjdk8AppletLayout = function () {
+        var sz = documentSize();
+        root.style.width = sz.w + 'px';
+        root.style.height = sz.h + 'px';
+        return applets.map(function (a) { var p = boxPosition(a.box); return p.x + ',' + p.y; }).join(';');
+      };
+
+      var args = ['org.emscriptenforge.jvm.applet.AppletRunner', '--documentbase', location.href];
+      applets.forEach(function (a) {
+        var p = boxPosition(a.box);
+        args.push('--applet', 'code=' + a.code, 'width=' + a.width, 'height=' + a.height,
+                  'x=' + p.x, 'y=' + p.y);
+        if (a.codebase) args.push('codebase=' + a.codebase);
+        if (a.archive) args.push('archive=' + a.archive);
+        if (a.name) args.push('name=' + a.name);
+        Object.keys(a.params).forEach(function (k) { args.push('param:' + k + '=' + a.params[k]); });
+      });
+
+      var userStatus = options.onStatus;
+      return run(Object.assign({}, options, {
+        root: root,
+        documentTitle: false,
+        args: (options.jvmArgs || []).concat(args),
+        jvmArgs: [],
+        onProgress: function (loaded, total) {
+          setText('Loading Java runtime ' + Math.round(100 * loaded / Math.max(total, 1)) + '%');
+          if (options.onProgress) options.onProgress(loaded, total);
+        },
+        onStatus: function (text) {
+          if (/started$/.test(text)) {
+            applets.forEach(function (a) { var s = a.box.querySelector('span'); if (s) s.textContent = ''; });
+          } else if (/failed/.test(text)) {
+            setText(text);
+          } else if (/^Loading/.test(text)) {
+            setText(text);
+          }
+          try { global.status = text; } catch (e) {}
+          if (userStatus) userStatus(text);
+        },
+      }));
     });
-
-    var userStatus = options.onStatus;
-    return run(Object.assign({}, options, {
-      root: root,
-      documentTitle: false,
-      args: (options.jvmArgs || []).concat(args),
-      jvmArgs: [],
-      onProgress: function (loaded, total) {
-        setText('Loading Java runtime ' + Math.round(100 * loaded / Math.max(total, 1)) + '%');
-        if (options.onProgress) options.onProgress(loaded, total);
-      },
-      onStatus: function (text) {
-        if (/started$/.test(text)) {
-          applets.forEach(function (a) { var s = a.box.querySelector('span'); if (s) s.textContent = ''; });
-        } else if (/failed/.test(text)) {
-          setText(text);
-        } else if (/^Loading/.test(text)) {
-          setText(text);
-        }
-        try { global.status = text; } catch (e) {}
-        if (userStatus) userStatus(text);
-      },
-    }));
   }
 
   // -------------------------------------------------------- Web Start
@@ -381,46 +434,162 @@
            !a.hasAttribute('download') && (!a.target || a.target === '_self');
   }
 
+  // ------------------------------------------- pages for the Java Plug-in
+
+  // deployJava.js (Oracle's Deployment Toolkit): deployJava.runApplet(...)
+  // writes an <applet> tag with document.write, except in browsers without
+  // the Java Plug-in, where it shows a "Java Plug-in is not supported" box
+  // instead; launch(url), launchEx(url) and launchWebStartApplication(url)
+  // (the createWebStartLaunchButton button) download the JNLP file or open
+  // a jnlp: URL.
+  var writes = null;        // document.write output, while it is captured
+  var appletScripts = [];   // scripts whose runApplet wrote their applets
+
+  function captureWrites(fn) {
+    var outer = writes;
+    writes = [];
+    document.write = function () { writes.push([].join.call(arguments, '')); };
+    document.writeln = function () { writes.push([].join.call(arguments, '') + '\n'); };
+    try { fn(); } finally {
+      var html = writes.join('');
+      writes = outer;
+      if (!outer) { delete document.write; delete document.writeln; }
+    }
+    return html;
+  }
+
+  function patchDeployJava(applets, jnlp) {
+    var dj = global.deployJava;
+    if (!dj || dj.__openjdk8) return;
+    dj.__openjdk8 = true;
+    if (applets) {
+      dj.runApplet = function (attributes, parameters) {
+        var script = document.currentScript;
+        if (writes || (script && document.readyState === 'loading')) {
+          // the page is being parsed (or a script runs again, below)
+          if (script) appletScripts.push(script);
+          dj.writeAppletTag(attributes, parameters);
+          return;
+        }
+        // called later, from an event handler: add the applet to the page
+        var html = captureWrites(function () { dj.writeAppletTag(attributes, parameters); });
+        if (script) script.insertAdjacentHTML('afterend', html);
+        else document.body.insertAdjacentHTML('beforeend', html);
+        startApplets();
+      };
+    }
+    if (jnlp) {
+      dj.isWebStartInstalled = function () { return true; };
+      dj.launch = dj.launchEx = dj.launchWebStartApplication = function (url) {
+        startJNLP(url);
+        return true;
+      };
+    }
+  }
+
+  // Scripts that called deployJava.runApplet before this script was loaded
+  // (a bookmarklet) wrote nothing: run them again, putting what they write
+  // after them.
+  function rerunAppletScripts() {
+    if (!global.deployJava) return;
+    var scripts = document.querySelectorAll('script:not([src])');
+    for (var i = 0; i < scripts.length; i++) {
+      var sc = scripts[i];
+      if (appletScripts.indexOf(sc) >= 0 || sc.__openjdk8) continue;
+      if (sc.type && !/javascript|ecmascript|^text\/jscript$/i.test(sc.type)) continue;
+      if (!/deployJava\s*\.\s*runApplet\s*\(/.test(sc.text)) continue;
+      sc.__openjdk8 = true;
+      try {
+        var html = captureWrites(function () { (0, eval)(sc.text); });
+        if (html) sc.insertAdjacentHTML('afterend', html);
+      } catch (e) {
+        console.warn('Java applet: running the page script again failed: ' + e);
+      }
+    }
+  }
+
+  // the "Java Plug-in is not supported by this browser" box of deployJava.js
+  function removePluginNotice(root) {
+    var box = (root || document).querySelector('#messagebox');
+    if (box && box.querySelector('a[href*="java.com/dt-redirect"]')) box.parentNode.removeChild(box);
+  }
+
+  // the applets not started yet
+  function startApplets() {
+    var applets = findApplets().filter(function (a) { return !a.el.__openjdk8; });
+    if (!applets.length) return;
+    if (running) console.warn('Java applet: a Java VM is already running in this page');
+    else runApplets({ applets: applets });
+  }
+
+  function startJNLP(url) {
+    if (running) console.warn('Java Web Start: a Java VM is already running in this page');
+    else runJNLP(url).catch(function (e) { console.error('Java Web Start: ' + e); });
+  }
+
+  // Frames of the same origin (iframes, framesets) that have applets or
+  // Web Start links get their own copy of this script; the frames of other
+  // sites cannot be reached.
+  function frameNeedsJava(win, doc) {
+    if (win.deployJava || doc.querySelector('applet, object, embed, iframe, frame')) return true;
+    return [].some.call(doc.links, isJnlpLink);
+  }
+
+  function initFrame(frame) {
+    var win, doc;
+    try { win = frame.contentWindow; doc = frame.contentDocument; } catch (e) { return; }
+    if (!win || !doc || !doc.documentElement || win.OpenJDK8 || doc.__openjdk8) return;
+    if (!frameNeedsJava(win, doc)) return;
+    doc.__openjdk8 = true;
+    var s = doc.createElement('script');
+    s.src = thisScript.src;
+    s.setAttribute('data-base', new URL(defaultBase, location.href).href);
+    ['data-applets', 'data-jnlp', 'data-frames'].forEach(function (n) {
+      if (thisScript.hasAttribute(n)) s.setAttribute(n, thisScript.getAttribute(n));
+    });
+    (doc.body || doc.documentElement).appendChild(s);
+  }
+
+  function initFrames() {
+    var frames = document.querySelectorAll('iframe, frame');
+    for (var i = 0; i < frames.length; i++) {
+      var f = frames[i];
+      if (!f.__openjdk8) {
+        f.__openjdk8 = true;
+        // again whenever another page is loaded into it
+        f.addEventListener('load', initFrame.bind(null, f));
+      }
+      initFrame(f);
+    }
+  }
+
   global.OpenJDK8 = { run: run, runApplets: runApplets, findApplets: findApplets,
                       runJNLP: runJNLP, defaultJvmArgs: DEFAULT_JVM_ARGS };
 
-  var auto = thisScript ? thisScript.getAttribute('data-applets') : null;
-  if (auto !== 'off') {
-    var go = function () { if (findApplets().length) runApplets(); };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go);
-    else go();
-  }
-  if (!thisScript || thisScript.getAttribute('data-jnlp') !== 'off') {
-    // Pages written for Oracle's deployJava.js launch Web Start with
-    // deployJava.launch(url) (the createWebStartLaunchButton button),
-    // launchEx(url) or launchWebStartApplication(url), which download the
-    // JNLP file or open a jnlp: URL: run it here instead.
-    var patchDeployJava = function () {
-      var dj = global.deployJava;
-      if (!dj || dj.__openjdk8) return;
-      dj.__openjdk8 = true;
-      dj.isWebStartInstalled = function () { return true; };
-      dj.launch = dj.launchEx = dj.launchWebStartApplication = function (url) {
-        if (running) {
-          console.warn('Java Web Start: a Java VM is already running in this page');
-        } else {
-          runJNLP(url).catch(function (e) { console.error('Java Web Start: ' + e); });
-        }
-        return true;
-      };
-    };
-    patchDeployJava();
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', patchDeployJava);
+  var opt = function (name) { return !thisScript || thisScript.getAttribute(name) !== 'off'; };
+  var autoApplets = opt('data-applets'), autoJnlp = opt('data-jnlp');
+  var ready = function () {
+    patchDeployJava(autoApplets, autoJnlp);
+    if (autoApplets) {
+      rerunAppletScripts();
+      removePluginNotice();
+      // deployJava.js adds its box once the page has loaded
+      new MutationObserver(function () { removePluginNotice(); })
+        .observe(document.body, { childList: true });
+      startApplets();
+    }
+    if (opt('data-frames') && thisScript && thisScript.src) initFrames();
+  };
+  patchDeployJava(autoApplets, autoJnlp);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready);
+  else ready();
+  if (autoJnlp) {
     document.addEventListener('click', function (ev) {
       if (ev.defaultPrevented || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
       var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
       if (!isJnlpLink(a)) return;
       ev.preventDefault();
-      if (running) {
-        console.warn('Java Web Start: a Java VM is already running in this page');
-        return;
-      }
-      runJNLP(a.href).catch(function (e) { console.error('Java Web Start: ' + e); });
+      startJNLP(a.href);
     });
   }
 })(typeof globalThis !== 'undefined' ? globalThis : window);
