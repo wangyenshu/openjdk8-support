@@ -211,9 +211,23 @@
       }
     }
     spec.params = params;
-    spec.width = parseInt(attr(el, 'width'), 10) || 300;
-    spec.height = parseInt(attr(el, 'height'), 10) || 200;
+    spec.width = size(el, 'width', 300);
+    spec.height = size(el, 'height', 200);
     return spec;
+  }
+
+  // width or height in pixels, or percent of the parent element (0 is a
+  // size: such applets open windows of their own)
+  function size(el, name, def) {
+    var v = attr(el, name);
+    var n = v === null ? NaN : parseFloat(v);
+    if (isNaN(n)) return def;
+    if (/%\s*$/.test(v)) {
+      var p = el.parentNode;
+      n = p ? (name === 'width' ? p.clientWidth : p.clientHeight) * n / 100 : 0;
+      return Math.round(n) || def;
+    }
+    return Math.round(n);
   }
 
   function findApplets(root) {
@@ -295,6 +309,7 @@
       box.className = 'openjdk8-applet-box';
       box.style.width = a.width + 'px';
       box.style.height = a.height + 'px';
+      if (!a.width || !a.height) box.style.border = '0';
       box.innerHTML = '<span>Loading Java&hellip;</span>';
       a.el.parentNode.insertBefore(box, a.el);
       a.el.style.display = 'none';
@@ -332,7 +347,8 @@
       var args = ['org.emscriptenforge.jvm.applet.AppletRunner', '--documentbase', location.href];
       applets.forEach(function (a) {
         var p = boxPosition(a.box);
-        args.push('--applet', 'code=' + a.code, 'width=' + a.width, 'height=' + a.height,
+        args.push('--applet', 'code=' + a.code,
+                  'width=' + Math.max(a.width, 1), 'height=' + Math.max(a.height, 1),
                   'x=' + p.x, 'y=' + p.y);
         if (a.codebase) args.push('codebase=' + a.codebase);
         if (a.archive) args.push('archive=' + a.archive);
@@ -429,9 +445,10 @@
     }, function (e) { done(); throw e; });
   }
 
+  // a link to a JNLP file (in whatever window it would open: there it would
+  // only be downloaded)
   function isJnlpLink(a) {
-    return a && a.href && /\.jnlp$/i.test(a.pathname) &&
-           !a.hasAttribute('download') && (!a.target || a.target === '_self');
+    return a && a.href && /\.jnlp$/i.test(a.pathname) && !a.hasAttribute('download');
   }
 
   // ------------------------------------------- pages for the Java Plug-in
@@ -584,12 +601,16 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready);
   else ready();
   if (autoJnlp) {
+    // before the page's own handlers (capture phase): pages often open such
+    // links with scripts of their own, e.g. in a popup, where the file would
+    // only be downloaded
     document.addEventListener('click', function (ev) {
       if (ev.defaultPrevented || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
       var a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
       if (!isJnlpLink(a)) return;
       ev.preventDefault();
+      ev.stopPropagation();
       startJNLP(a.href);
-    });
+    }, true);
   }
 })(typeof globalThis !== 'undefined' ? globalThis : window);
